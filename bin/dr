@@ -1,0 +1,38 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_command dragon-drop
+
+case "${1:-}" in
+  -h|--help)
+    echo "Usage: dr FILE [FILE ...]"
+    echo
+    echo "Hands the files to dragon-drop. A name that matches no file is tried"
+    echo "again as a partial, case-insensitive match; several matches open fzf."
+    exit 0
+    ;;
+esac
+
+[ $# -gt 0 ] || die "No files. dragon-drop needs something to carry. Pass one or more names, whole or partial."
+
+shopt -s nullglob nocaseglob
+
+files=()
+for name in "$@"; do
+  if [ -e "$name" ]; then
+    files+=("$name")
+    continue
+  fi
+  matches=(*"$name"*)
+  case ${#matches[@]} in
+    0) echo "not found: $name" >&2 ;;
+    1) files+=("${matches[0]}") ;;
+    *) mapfile -t chosen < <(printf '%s\n' "${matches[@]}" | pick "$name" --multi)
+       files+=("${chosen[@]}") ;;
+  esac
+done
+
+[ ${#files[@]} -gt 0 ] || die "Nothing to drag. None of the names matched a file. Check the spelling."
+
+dragon-drop "${files[@]}"

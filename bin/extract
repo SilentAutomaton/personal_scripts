@@ -1,0 +1,64 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+DEST="."
+
+usage() {
+  cat <<'EOF'
+Usage: extract [-d DIR] ARCHIVE [ARCHIVE ...]
+
+Options:
+  -d DIR  extract into DIR instead of the working directory
+  -h      show this message
+
+With no archive the working directory is listed with fzf.
+EOF
+}
+
+while getopts "d:h" opt; do
+  case $opt in
+    d) DEST="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    \?) usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ $# -eq 0 ]; then
+  mapfile -t chosen < <(
+    find . -maxdepth 1 -type f \
+      \( -iname '*.zip' -o -iname '*.rar' -o -iname '*.7z' -o -iname '*.tar*' \
+         -o -iname '*.tgz' -o -iname '*.tbz2' -o -iname '*.txz' -o -iname '*.gz' \
+         -o -iname '*.bz2' -o -iname '*.xz' -o -iname '*.lzma' -o -iname '*.iso' \
+         -o -iname '*.cpio' -o -iname '*.deb' -o -iname '*.rpm' \) -printf '%P\n' \
+    | pick archive --multi)
+  [ ${#chosen[@]} -gt 0 ] || exit 1
+  set -- "${chosen[@]}"
+fi
+
+mkdir -p "$DEST" || die "Cannot use $DEST. The directory could not be created. Choose a writable path."
+
+failed=0
+for archive in "$@"; do
+  if [ ! -f "$archive" ]; then
+    echo "skip: $archive (not a file)" >&2
+    failed=$((failed + 1))
+    continue
+  fi
+  archive=$(readlink -f "$archive")
+  echo "extract: $archive -> $DEST"
+  case "${archive,,}" in
+    *.lzma)   unlzma -c "$archive" > "$DEST/$(basename "${archive%.*}")" ;;
+    *.cpio)   (cd "$DEST" && cpio -id < "$archive") ;;
+    *.ace|*.cba) (cd "$DEST" && unace x "$archive") ;;
+    *.exe)    cabextract -d "$DEST" "$archive" ;;
+    *.tar|*.tar.*|*.tgz|*.tbz2|*.txz|*.cbt) bsdtar xf "$archive" -C "$DEST" ;;
+    *.gz)     gunzip -c "$archive" > "$DEST/$(basename "${archive%.*}")" ;;
+    *.bz2)    bunzip2 -c "$archive" > "$DEST/$(basename "${archive%.*}")" ;;
+    *.xz)     unxz -c "$archive" > "$DEST/$(basename "${archive%.*}")" ;;
+    *)        bsdtar xf "$archive" -C "$DEST" ;;
+  esac || { echo "failed: $archive" >&2; failed=$((failed + 1)); }
+done
+
+[ "$failed" -eq 0 ]

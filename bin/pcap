@@ -1,0 +1,43 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_command wireshark
+
+usage() {
+  cat <<'EOF'
+Usage: pcap [HOST]
+
+Captures on a remote host over ssh and pipes the packets into wireshark.
+HOST is a name from PCAP_HOSTS. With no argument the list is shown with fzf.
+Use 'local' to capture on this machine instead.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+need_config PCAP_HOSTS
+read -r -a pairs <<< "$PCAP_HOSTS"
+
+names=(local)
+for pair in "${pairs[@]}"; do
+  names+=("${pair%%=*}")
+done
+
+name="${1:-$(printf '%s\n' "${names[@]}" | pick host)}"
+[ -n "$name" ] || exit 1
+
+if [ "$name" = local ]; then
+  exec wireshark
+fi
+
+target=""
+for pair in "${pairs[@]}"; do
+  [ "${pair%%=*}" = "$name" ] && target="${pair#*=}"
+done
+[ -n "$target" ] || die "Unknown host '$name'. It is not in PCAP_HOSTS. Add it there as name=user@host."
+
+echo "capturing on $target, close wireshark to stop"
+ssh "$target" sudo tcpdump -i any -U -s0 -w - 'not port 22' | wireshark -k -i -

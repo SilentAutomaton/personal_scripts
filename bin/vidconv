@@ -1,0 +1,152 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_command ffmpeg ffprobe
+
+FORCE=0
+DRY=0
+
+usage() {
+  cat <<'EOF'
+Usage: vidconv [-f] [-n] PRESET [file-or-dir ...]
+
+Presets:
+  720p      cap the long side at 1280, the short at 720, H.264/AAC mp4
+  tg        H.264 yuv420p + AAC + faststart, deinterlaced when needed
+  to EXT    change the container to EXT, copy nothing else
+
+Options:
+  -f  overwrite an existing output
+  -n  dry run, print the decisions only
+  -h  show this message
+
+With no arguments the preset is chosen with fzf and the working directory is used.
+EOF
+}
+
+while getopts "fnh" opt; do
+  case $opt in
+    f) FORCE=1 ;;
+    n) DRY=1 ;;
+    h) usage; exit 0 ;;
+    \?) usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+preset="${1:-}"
+if [ -z "$preset" ]; then
+  preset=$(printf '%s\n' 720p tg "to mp4" "to mkv" | pick preset) || exit 1
+  read -r -a chosen <<< "$preset"
+  set -- "${chosen[@]}"
+  preset="$1"
+fi
+shift
+
+target_ext=""
+if [ "$preset" = to ]; then
+  target_ext="${1:-}"
+  [ -n "$target_ext" ] || die "No target extension. The 'to' preset needs one, as in 'vidconv to mkv'. Add the extension."
+  shift
+fi
+
+case "$preset" in
+  720p|tg|to) ;;
+  *) die "Unknown preset '$preset'. Only 720p, tg and to EXT exist. Run vidconv -h for the list." ;;
+esac
+
+[ $# -gt 0 ] || set -- .
+
+files=()
+for path in "$@"; do
+  if [ -d "$path" ]; then
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(
+      find "$path" -type f \
+        \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mov' \
+           -o -iname '*.flv' -o -iname '*.webm' -o -iname '*.wmv' -o -iname '*.mpg' \
+           -o -iname '*.mpeg' -o -iname '*.mts' -o -iname '*.m2ts' -o -iname '*.3gp' \) -print0)
+  elif [ -f "$path" ]; then
+    files+=("$path")
+  else
+    echo "skip: $path (not a file or directory)" >&2
+  fi
+done
+
+[ ${#files[@]} -gt 0 ] || die "No video files found. The given paths hold none. Point vidconv at a video or a directory that has some."
+
+probe() {
+  ffprobe -v error -select_streams v:0 -show_entries "stream=$2" -of default=nw=1:nk=1 "$1" 2>/dev/null
+}
+
+# Fills out_file and ffmpeg_args, or returns 1 with a reason in skip_reason.
+plan_720p() {
+  local in="$1" w h max_w max_h
+  w=$(probe "$in" width); h=$(probe "$in" height)
+  [ -n "$w" ] && [ -n "$h" ] || { skip_reason="no video stream"; return 1; }
+  if [ "$w" -gt "$h" ]; then max_w=1280; max_h=720; else max_w=720; max_h=1280; fi
+  if [ "$w" -le "$max_w" ] && [ "$h" -le "$max_h" ] && [ "${in##*.}" = mp4 ]; then
+    skip_reason="already ${w}x${h} mp4"
+    return 1
+  fi
+  out_file="${in%.*}_720p.mp4"
+  ffmpeg_args=(-vf "scale=w=$max_w:h=$max_h:force_original_aspect_ratio=decrease,setsar=1,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+               -c:v libx264 -crf 23 -c:a aac -b:a 192k -ar 44100 -ac 2)
+}
+
+plan_tg() {
+  local in="$1" vcodec pix acodec field vf
+  vcodec=$(probe "$in" codec_name)
+  pix=$(probe "$in" pix_fmt)
+  field=$(probe "$in" field_order)
+  acodec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$in" 2>/dev/null)
+  if [ "${in##*.}" = mp4 ] && [ "$vcodec" = h264 ] && [ "$pix" = yuv420p ] && [ "$acodec" = aac ]; then
+    skip_reason="already mp4 h264 yuv420p aac"
+    return 1
+  fi
+  vf="scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+  [[ "$field" =~ ^(tt|bb|tb|bt)$ ]] && vf="yadif,$vf"
+  out_file="${in%.*}.fixed.mp4"
+  ffmpeg_args=(-vf "$vf" -c:v libx264 -preset slow -crf 18 -profile:v high -level 3.1
+               -movflags +faststart -c:a aac -b:a 128k)
+}
+
+plan_to() {
+  local in="$1"
+  if [ "${in##*.}" = "$target_ext" ]; then
+    skip_reason="already .$target_ext"
+    return 1
+  fi
+  out_file="${in%.*}.$target_ext"
+  ffmpeg_args=()
+}
+
+converted=0
+skipped=0
+failed=0
+
+for in in "${files[@]}"; do
+  out_file=""; ffmpeg_args=(); skip_reason=""
+  if ! "plan_$preset" "$in"; then
+    echo "skip: $in ($skip_reason)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if [ -e "$out_file" ] && [ "$FORCE" -eq 0 ]; then
+    echo "skip: $in (output exists, use -f)"
+    skipped=$((skipped + 1))
+    continue
+  fi
+  echo "convert: $in -> $out_file"
+  [ "$DRY" -eq 1 ] && { converted=$((converted + 1)); continue; }
+  if ffmpeg -nostdin -y -i "$in" "${ffmpeg_args[@]}" "$out_file"; then
+    converted=$((converted + 1))
+  else
+    echo "failed: $in" >&2
+    rm -f "$out_file"
+    failed=$((failed + 1))
+  fi
+done
+
+echo "converted $converted, skipped $skipped, failed $failed"
+[ "$failed" -eq 0 ]

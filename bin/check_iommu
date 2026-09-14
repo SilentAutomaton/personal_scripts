@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uo pipefail
+
+shopt -s nullglob
+groups=(/sys/kernel/iommu_groups/*)
+[ ${#groups[@]} -gt 0 ] || { echo "No IOMMU groups. The kernel has IOMMU turned off. Add intel_iommu=on or amd_iommu=on to the kernel command line." >&2; exit 1; }
+
+for group in "${groups[@]}"; do
+  echo "IOMMU Group ${group##*/}:"
+  for device in "$group"/devices/*; do
+    echo -e "\t$(lspci -nns "${device##*/}")"
+  done
+done

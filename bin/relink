@@ -1,0 +1,58 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+DRY=0
+
+usage() {
+  cat <<'EOF'
+Usage: relink [-n] DIR [DIR ...]
+
+Replaces every symlink under DIR with a hard link to the same file.
+A symlink whose target cannot be hard linked, across filesystems for
+example, is left untouched.
+
+Options:
+  -n  dry run, print the decisions only
+  -h  show this message
+EOF
+}
+
+while getopts "nh" opt; do
+  case $opt in
+    n) DRY=1 ;;
+    h) usage; exit 0 ;;
+    \?) usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[ $# -gt 0 ] || die "No directory. relink needs somewhere to look. Pass a directory."
+
+converted=0
+skipped=0
+
+for dir in "$@"; do
+  [ -d "$dir" ] || { echo "skip: $dir (not a directory)" >&2; skipped=$((skipped + 1)); continue; }
+  while IFS= read -r -d '' link; do
+    target=$(readlink -f "$link")
+    if [ ! -f "$target" ]; then
+      echo "skip: $link (target is not a regular file)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    echo "relink: $link -> $target"
+    [ "$DRY" -eq 1 ] && { converted=$((converted + 1)); continue; }
+    # The hard link is made first: a failed ln must not leave the symlink gone.
+    temp="$link.relink.$$"
+    if ln "$target" "$temp" 2>/dev/null && mv -f "$temp" "$link"; then
+      converted=$((converted + 1))
+    else
+      rm -f "$temp"
+      echo "failed: $link (cannot hard link across filesystems)" >&2
+      skipped=$((skipped + 1))
+    fi
+  done < <(find "$dir" -type l -print0)
+done
+
+echo "relinked $converted, left alone $skipped"

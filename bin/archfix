@@ -1,0 +1,65 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: archfix COMMAND
+
+  cache      purge the pip and paru package caches
+  kernel     rebuild the initramfs and the grub config
+  reinstall  save the explicit package list, then reinstall every package from it
+  time       sync the clock once with NTP
+  clamav     update the ClamAV signatures
+
+With no command the list is shown with fzf.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+command_name="${1:-$(printf '%s\n' cache kernel reinstall time clamav | pick archfix)}"
+[ -n "$command_name" ] || exit 1
+
+case "$command_name" in
+  cache)
+    need_command paru
+    python -m pip cache purge
+    paru -Scc
+    ;;
+  kernel)
+    need_command mkinitcpio
+    sudo -A mkinitcpio -P
+    sudo -A grub-mkconfig -o /boot/grub/grub.cfg
+    ;;
+  reinstall)
+    need_config ARCHFIX_PACKAGE_LIST
+    need_command paru
+    mkdir -p "$(dirname "$ARCHFIX_PACKAGE_LIST")"
+    pacman -Qqe > "$ARCHFIX_PACKAGE_LIST"
+    count=$(wc -l < "$ARCHFIX_PACKAGE_LIST")
+    confirm "Reinstall $count packages from $ARCHFIX_PACKAGE_LIST?" || exit 0
+    mapfile -t packages < "$ARCHFIX_PACKAGE_LIST"
+    paru -S --needed "${packages[@]}"
+    ;;
+  time)
+    sudo -A systemctl start systemd-timesyncd
+    for _ in $(seq 15); do
+      timedatectl show | grep -q 'NTPSynchronized=yes' && break
+      sleep 1
+    done
+    sudo -A systemctl stop systemd-timesyncd
+    timedatectl show | grep -q 'NTPSynchronized=yes' \
+      || die "The clock is still not synced. No NTP server answered in fifteen seconds. Check the network and run this again."
+    timedatectl | head -3
+    ;;
+  clamav)
+    need_command freshclam
+    sudo -A freshclam
+    ;;
+  *)
+    die "Unknown command '$command_name'. archfix has cache, kernel, reinstall, time and clamav. Run archfix -h for the list."
+    ;;
+esac

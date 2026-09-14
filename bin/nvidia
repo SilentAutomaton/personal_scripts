@@ -1,0 +1,71 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: nvidia COMMAND
+
+  install    install the driver packages from NVIDIA_PACKAGES
+  remove     remove those same packages
+  downgrade  downgrade them with the downgrade tool
+  reload     reload the nvidia_uvm module, the usual fix after a suspend
+  xtoggle    move the Xorg NVIDIA outputclass config aside or back, then end the session
+
+With no command the list is shown with fzf.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+command_name="${1:-$(printf '%s\n' install remove downgrade reload xtoggle | pick nvidia)}"
+[ -n "$command_name" ] || exit 1
+
+packages() {
+  need_config NVIDIA_PACKAGES
+  read -r -a list <<< "$NVIDIA_PACKAGES"
+  printf '%s\n' "${list[@]}"
+}
+
+case "$command_name" in
+  install)
+    need_command paru
+    mapfile -t list < <(packages)
+    paru -S --needed "${list[@]}"
+    ;;
+  remove)
+    need_command paru
+    mapfile -t list < <(packages)
+    paru -R "${list[@]}"
+    ;;
+  downgrade)
+    need_command downgrade
+    mapfile -t list < <(packages)
+    sudo -A downgrade "${list[@]}"
+    ;;
+  reload)
+    sudo -A rmmod nvidia_uvm && sudo -A modprobe nvidia_uvm
+    ;;
+  xtoggle)
+    need_config NVIDIA_XORG_CONF NVIDIA_XORG_BACKUP
+    if [ -e "$NVIDIA_XORG_CONF" ]; then
+      action="disable the NVIDIA outputclass"
+      from="$NVIDIA_XORG_CONF"; to="$NVIDIA_XORG_BACKUP"
+    elif [ -e "$NVIDIA_XORG_BACKUP" ]; then
+      action="enable the NVIDIA outputclass"
+      from="$NVIDIA_XORG_BACKUP"; to="$NVIDIA_XORG_CONF"
+    else
+      die "Neither config is there. $NVIDIA_XORG_CONF and $NVIDIA_XORG_BACKUP are both missing. Check NVIDIA_XORG_CONF."
+    fi
+    confirm "This will $action and end your session, closing every program. Continue?" || exit 0
+    sudo -A mkdir -p "$(dirname "$to")"
+    sudo -A mv "$from" "$to" || die "The config was not moved. The move from $from failed. Check the permissions."
+    # This kills this script too. Nothing may follow it.
+    sudo -A pkill -u "$USER"
+    ;;
+  *)
+    die "Unknown command '$command_name'. nvidia has install, remove, downgrade, reload and xtoggle. Run nvidia -h for the list."
+    ;;
+esac

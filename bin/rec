@@ -1,0 +1,61 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_command ffmpeg
+
+MODE=""
+
+usage() {
+  cat <<'EOF'
+Usage: rec [screen|voice]
+
+  screen  record the screen and the system sound
+  voice   record the microphone only
+
+Stop the recording with Ctrl-C. With no argument the mode is chosen with fzf.
+Screen recordings go to REC_DIR, voice recordings to the working directory.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  screen|voice) MODE="$1" ;;
+  "") MODE=$(printf '%s\n' screen voice | pick mode) || exit 1 ;;
+  *) usage >&2; exit 1 ;;
+esac
+
+sink_monitor() {
+  need_command pactl
+  echo "$(pactl info | awk -F': ' '/Default Sink/ {print $2}').monitor"
+}
+
+if [ "$MODE" = voice ]; then
+  out="./voice_$(date +'%Y%m%d_%H%M%S').wav"
+  echo "recording to $out, Ctrl-C to stop"
+  exec ffmpeg -y -f pulse -i default -c:a pcm_s16le -ac 1 -ar 16000 "$out"
+fi
+
+need_config REC_DIR
+mkdir -p "$REC_DIR" || die "Cannot use $REC_DIR. The directory could not be created. Set REC_DIR to a writable path."
+out="$REC_DIR/screen_$(date +'%Y%m%d_%H%M%S').mp4"
+audio=$(sink_monitor)
+
+case "$(session_type)" in
+  x11)
+    need_command xrandr
+    size=$(xrandr | awk '/ connected primary/ {print $4}' | cut -d'+' -f1)
+    [ -n "$size" ] || size=$(xrandr | awk '/\*/ {print $1; exit}')
+    echo "recording to $out, Ctrl-C to stop"
+    exec ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
+      -f pulse -i "$audio" -c:v libx264 -preset ultrafast -c:a aac "$out"
+    ;;
+  wayland)
+    need_command wf-recorder
+    echo "recording to $out, Ctrl-C to stop"
+    exec wf-recorder -f "$out" --audio="$audio" -c libx264 -p preset=ultrafast
+    ;;
+  *)
+    die "Cannot record the screen. The session is neither X11 nor Wayland. Use 'rec voice' or start a graphical session."
+    ;;
+esac

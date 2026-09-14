@@ -1,0 +1,112 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: focus on [MINUTES] | block | unblock | status
+
+  on       block FOCUS_DOMAINS in unbound and keep killing FOCUS_PROGRAMS
+           for MINUTES, sixty by default. The block is lifted on every exit
+           path, Ctrl-C included.
+  block    block the domains with no timer and no process killing
+  unblock  lift the block, for when a session died without cleaning up
+  status   show whether the domains are blocked
+EOF
+}
+
+# A blacklist we can write without root is not the one unbound reads, so it is
+# edited directly and no reload follows it.
+system_file() {
+  ! [ -w "$FOCUS_BLACKLIST" ] \
+    && ! { [ ! -e "$FOCUS_BLACKLIST" ] && [ -w "$(dirname "$FOCUS_BLACKLIST")" ]; }
+}
+
+edit() {
+  if system_file; then sudo -A "$@"; else "$@"; fi
+}
+
+reload_unbound() {
+  system_file || return 0
+  systemctl is-active --quiet unbound || return 0
+  sudo -A systemctl restart unbound \
+    || die "unbound did not come back. The restart failed and DNS may be down. Run: systemctl status unbound"
+}
+
+zone_line() {
+  echo "local-zone: \"$1\" always_refuse"
+}
+
+blocked() {
+  [ -e "$FOCUS_BLACKLIST" ] && grep -qxF "$(zone_line "${domains[0]}")" "$FOCUS_BLACKLIST"
+}
+
+block() {
+  edit touch "$FOCUS_BLACKLIST"
+  edit cp "$FOCUS_BLACKLIST" "$FOCUS_BLACKLIST.bak.$(date +%s)"
+  for domain in "${domains[@]}"; do
+    grep -qxF "$(zone_line "$domain")" "$FOCUS_BLACKLIST" && continue
+    zone_line "$domain" | edit tee -a "$FOCUS_BLACKLIST" >/dev/null
+  done
+  reload_unbound
+}
+
+unblock() {
+  [ -e "$FOCUS_BLACKLIST" ] || return 0
+  local kept
+  kept=$(mktemp)
+  cp "$FOCUS_BLACKLIST" "$kept"
+  for domain in "${domains[@]}"; do
+    grep -vxF "$(zone_line "$domain")" "$kept" > "$kept.new"
+    mv "$kept.new" "$kept"
+  done
+  edit cp "$kept" "$FOCUS_BLACKLIST"
+  rm -f "$kept"
+  reload_unbound
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") usage >&2; exit 1 ;;
+esac
+
+need_config FOCUS_DOMAINS FOCUS_PROGRAMS FOCUS_BLACKLIST
+read -r -a domains <<< "$FOCUS_DOMAINS"
+read -r -a programs <<< "$FOCUS_PROGRAMS"
+
+case "$1" in
+  status)
+    if blocked; then echo "focus is on, ${#domains[@]} domains blocked"; else echo "focus is off"; fi
+    exit 0
+    ;;
+  block)
+    block
+    echo "focus is on, ${#domains[@]} domains blocked"
+    exit 0
+    ;;
+  unblock|off)
+    unblock
+    echo "focus is off"
+    exit 0
+    ;;
+  on) ;;
+  *) die "Unknown command '$1'. focus has on, block, unblock and status. Run focus -h for the list." ;;
+esac
+
+minutes="${2:-60}"
+[[ "$minutes" =~ ^[0-9]+$ ]] || die "'$minutes' is not a number of minutes. The duration must be a whole number. Try: focus on 45"
+
+confirm "Block ${#domains[@]} domains and kill ${programs[*]} for $minutes minutes?" || exit 0
+
+trap 'echo; unblock; echo "focus is off"; exit 0' EXIT INT TERM
+
+block
+echo "focus is on until $(date -d "+$minutes minutes" +%H:%M), Ctrl-C to stop early"
+
+deadline=$(( $(date +%s) + minutes * 60 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  for program in "${programs[@]}"; do
+    pkill -x "$program" 2>/dev/null && echo "killed $program"
+  done
+  sleep 2
+done

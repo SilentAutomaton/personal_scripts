@@ -1,0 +1,58 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: novpn [BROWSER] [URL ...]
+
+Runs a browser as NOVPN_USER, whose traffic is routed past the VPN through the
+default gateway. The routing rule is removed when the browser exits.
+BROWSER defaults to NOVPN_BROWSER.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+[ "$EUID" -ne 0 ] || die "Do not run this as root. The whole point is to run the browser as another unprivileged user. Run it as yourself."
+
+need_config NOVPN_USER NOVPN_DNS NOVPN_BROWSER
+
+browser="$NOVPN_BROWSER"
+if [ $# -gt 0 ] && command -v "$1" >/dev/null; then
+  browser="$1"
+  shift
+fi
+
+bypass_uid=$(id -u "$NOVPN_USER" 2>/dev/null) \
+  || die "No such user: $NOVPN_USER. The bypass account does not exist. Create it with: sudo useradd -m -s /bin/bash $NOVPN_USER"
+
+routing_table=100
+rule_priority=50
+
+read -r interface gateway < <(ip route show default | awk '{for (i=1;i<NF;i++) {if ($i=="dev") dev=$(i+1); if ($i=="via") via=$(i+1)}} {print dev, via; exit}')
+[ -n "${interface:-}" ] && [ -n "${gateway:-}" ] \
+  || die "No default route. The gateway could not be found. Connect to a network first."
+
+cleanup() {
+  sudo -A ip rule del uidrange "$bypass_uid-$bypass_uid" table "$routing_table" priority "$rule_priority" 2>/dev/null
+  sudo -A ip route flush table "$routing_table" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+sudo -A ip route replace default via "$gateway" dev "$interface" table "$routing_table" \
+  || die "The bypass route was not added. ip route replace failed for $gateway on $interface. Check that the gateway is reachable."
+
+sudo -A ip rule del uidrange "$bypass_uid-$bypass_uid" table "$routing_table" priority "$rule_priority" 2>/dev/null
+sudo -A ip rule add uidrange "$bypass_uid-$bypass_uid" table "$routing_table" priority "$rule_priority" \
+  || die "The bypass rule was not added. ip rule add failed for uid $bypass_uid. Check that the kernel supports uidrange rules."
+
+xhost "+SI:localuser:$NOVPN_USER" >/dev/null 2>&1
+
+sudo -A -u "$NOVPN_USER" env \
+  "HOME=$(getent passwd "$NOVPN_USER" | cut -d: -f6)" \
+  "DISPLAY=${DISPLAY:-}" \
+  "XAUTHORITY=${XAUTHORITY:-}" \
+  "$browser" --dns-over-https-templates="https://$NOVPN_DNS/dns-query" "$@"

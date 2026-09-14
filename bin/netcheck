@@ -1,0 +1,51 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_command curl
+
+usage() {
+  cat <<'EOF'
+Usage: netcheck [-l] [-4|-6]
+
+  -l  also run the DNS leak test, which takes about ten seconds
+  -4  query over IPv4 only
+  -6  query over IPv6 only
+  -h  show this message
+EOF
+}
+
+LEAK=0
+family=()
+
+while getopts "l46h" opt; do
+  case $opt in
+    l) LEAK=1 ;;
+    4) family=(-4) ;;
+    6) family=(-6) ;;
+    h) usage; exit 0 ;;
+    \?) usage >&2; exit 1 ;;
+  esac
+done
+
+info=$(curl "${family[@]}" --silent --max-time 10 https://ifconfig.co/json) \
+  || die "No answer from ifconfig.co. The request timed out. Check the connection or the firewall."
+
+if command -v jq >/dev/null; then
+  jq -r '"IP:      \(.ip)
+Country: \(.country) (\(.country_iso))
+City:    \(.city // "unknown")
+ASN:     \(.asn // "unknown") \(.asn_org // "")"' <<< "$info"
+else
+  echo "$info"
+fi
+
+echo
+echo "Resolvers in use:"
+resolvectl status 2>/dev/null | awk '/DNS Servers/ {$1=$2=""; print "  " $0}' \
+  || grep '^nameserver' /etc/resolv.conf | sed 's/^/  /'
+
+if [ "$LEAK" -eq 1 ]; then
+  echo
+  exec "$(dirname "$(readlink -f "$0")")/../vendor/dnsleaktest"
+fi
