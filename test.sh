@@ -87,6 +87,16 @@ check "focus blocks once" "$(grep -c always_refuse "$work/blacklist.conf")" "3"
 check "focus restores" "$(md5sum < "$work/blacklist.conf")" "$before"
 check "focus status" "$(./bin/focus status)" "focus is off"
 
+# whisper: large-v3 must not resolve to the large-v3-turbo file beside it.
+mkdir -p "$work/models/ggml" "$work/models/ct2/large-v3-turbo"
+touch "$work/models/ggml/ggml-large-v3-turbo-q5_0.bin" "$work/models/ct2/large-v3-turbo/model.bin"
+export WHISPER_MODELS_DIR="$work/models"
+check "whisper finds a quantized ggml" "$(./bin/whisper -n)" \
+  "whisper.cpp: $work/models/ggml/ggml-large-v3-turbo-q5_0.bin"
+check "whisper finds a ct2 dir" "$(./bin/whisper -c -n)" \
+  "faster-whisper: $work/models/ct2/large-v3-turbo"
+check "whisper keeps large-v3 apart" "$(./bin/whisper -n -m large-v3 2>/dev/null)" ""
+
 echo
 [ "$failures" -eq 0 ] && echo "all checks passed" || echo "$failures check(s) failed"
 [ "$failures" -eq 0 ]

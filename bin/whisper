@@ -1,0 +1,129 @@
+#!/bin/bash
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../lib/common.sh"
+
+need_config WHISPER_MODELS_DIR
+
+usage() {
+  cat <<'EOF'
+Usage: whisper [-c] [-m MODEL] [-l LANG] [-n] FILE [FILE ...]
+
+Transcribes audio or video into FILE.srt and FILE.txt next to each file.
+
+  -c        use faster-whisper (CTranslate2) on the GPU instead of whisper.cpp
+  -m MODEL  model name, default large-v3-turbo
+  -l LANG   language code, default auto
+  -n        print the backend and the model path, transcribe nothing
+  -h        show this message
+
+Models live in WHISPER_MODELS_DIR: ggml/ggml-MODEL*.bin for whisper.cpp,
+ct2/MODEL/ for faster-whisper.
+EOF
+}
+
+CT2=0
+MODEL=large-v3-turbo
+LANGUAGE=auto
+DRY=0
+
+while getopts "cm:l:nh" opt; do
+  case $opt in
+    c) CT2=1 ;;
+    m) MODEL=$OPTARG ;;
+    l) LANGUAGE=$OPTARG ;;
+    n) DRY=1 ;;
+    h) usage; exit 0 ;;
+    \?) usage >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# An exact name first, then a quantized one: a bare glob on large-v3 would
+# also catch large-v3-turbo.
+model_path() {
+  local found
+  if [ "$CT2" -eq 1 ]; then
+    [ -r "$WHISPER_MODELS_DIR/ct2/$MODEL/model.bin" ] && echo "$WHISPER_MODELS_DIR/ct2/$MODEL"
+    return
+  fi
+  for found in "$WHISPER_MODELS_DIR/ggml/ggml-$MODEL.bin" "$WHISPER_MODELS_DIR"/ggml/ggml-"$MODEL"-q*.bin; do
+    [ -r "$found" ] && { echo "$found"; return; }
+  done
+}
+
+available() {
+  if [ "$CT2" -eq 1 ]; then
+    ls "$WHISPER_MODELS_DIR/ct2" 2>/dev/null
+  else
+    ls "$WHISPER_MODELS_DIR/ggml" 2>/dev/null
+  fi | tr '\n' ' '
+}
+
+model=$(model_path)
+[ -n "$model" ] || die "No model $MODEL. It is not in $WHISPER_MODELS_DIR. Available: $(available)"
+
+if [ "$DRY" -eq 1 ]; then
+  if [ "$CT2" -eq 1 ]; then echo "faster-whisper: $model"; else echo "whisper.cpp: $model"; fi
+  exit 0
+fi
+
+[ $# -gt 0 ] || die "No files. There is nothing to transcribe. Pass one or more audio or video files."
+
+transcribe_cpp() {
+  local wav
+  wav=$(mktemp --suffix=.wav)
+  ffmpeg -loglevel error -y -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
+    || { rm -f "$wav"; die "Cannot read $1. ffmpeg found no audio in it. Check the file."; }
+  whisper-cli -m "$model" -l "$LANGUAGE" -osrt -otxt -of "${1%.*}" "$wav"
+  local status=$?
+  rm -f "$wav"
+  return $status
+}
+
+transcribe_ct2() {
+  "$WHISPER_CT_PYTHON" - "$model" "$LANGUAGE" "$1" "${1%.*}" <<'EOF'
+import sys
+from faster_whisper import WhisperModel
+
+model_dir, language, audio, base = sys.argv[1:]
+
+try:
+    model = WhisperModel(model_dir, device="cuda", compute_type="float16")
+except (RuntimeError, ValueError) as error:
+    print(f"GPU unavailable ({error}), running on the CPU", file=sys.stderr)
+    model = WhisperModel(model_dir, device="cpu", compute_type="int8")
+
+segments, _ = model.transcribe(audio, language=None if language == "auto" else language,
+                               vad_filter=True)
+
+
+def stamp(seconds: float) -> str:
+    ms = round(seconds * 1000)
+    return f"{ms // 3600000:02}:{ms // 60000 % 60:02}:{ms // 1000 % 60:02},{ms % 1000:03}"
+
+
+with open(f"{base}.srt", "w") as srt, open(f"{base}.txt", "w") as txt:
+    for number, segment in enumerate(segments, 1):
+        text = segment.text.strip()
+        srt.write(f"{number}\n{stamp(segment.start)} --> {stamp(segment.end)}\n{text}\n\n")
+        txt.write(text + "\n")
+        print(f"[{stamp(segment.start)}] {text}")
+EOF
+}
+
+if [ "$CT2" -eq 1 ]; then
+  need_config WHISPER_CT_PYTHON
+  # ctranslate2 wheels load cuBLAS/cuDNN 12 from the venv, not the system CUDA.
+  venv=$(dirname "$(dirname "$WHISPER_CT_PYTHON")")
+  libs=$(find "$venv"/lib/python*/site-packages/nvidia -maxdepth 2 -name lib -type d 2>/dev/null | paste -sd:)
+  export LD_LIBRARY_PATH="${libs}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+else
+  need_command whisper-cli ffmpeg
+fi
+
+failed=0
+for file in "$@"; do
+  [ -r "$file" ] || { echo "not found: $file" >&2; failed=1; continue; }
+  if [ "$CT2" -eq 1 ]; then transcribe_ct2 "$file"; else transcribe_cpp "$file"; fi || failed=1
+done
+exit $failed

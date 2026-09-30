@@ -28,6 +28,7 @@ where a choice exists opens fzf instead of failing.
 | `novpn` | run a browser as a second user whose traffic bypasses the VPN |
 | `pcap` | capture on a remote host over ssh, straight into wireshark |
 | `focus` | block distracting domains in unbound and kill distracting programs |
+| `whisper` | transcribe into `.srt` and `.txt` with whisper.cpp, or faster-whisper with `-c` |
 
 ## Checking it
 
