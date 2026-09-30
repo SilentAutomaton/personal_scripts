@@ -1,6 +1,6 @@
 # usefull_scripts
 
-Thirteen commands consolidated out of four years of one-off scripts.
+Twelve commands consolidated out of four years of one-off scripts.
 
 ## Install
 
@@ -17,7 +17,6 @@ where a choice exists opens fzf instead of failing.
 | Command | Does |
 |---|---|
 | `vidconv` | transcode video: `720p`, `tg` for messengers, `to EXT` for the container |
-| `ytd` | yt-dlp wrapper: audio, fragment, watch, format picker, URL from the clipboard |
 | `extract` | extract any archive into the working directory or `-d DIR` |
 | `rec` | record the screen with sound, or the microphone, on X11 and Wayland |
 | `dr` | drag files out of the terminal, matching partial names |
