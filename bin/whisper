@@ -6,13 +6,14 @@ need_config WHISPER_MODELS_DIR
 
 usage() {
   cat <<'EOF'
-Usage: whisper [-c] [-m MODEL] [-l LANG] [-n] FILE [FILE ...]
+Usage: whisper [-c] [-m MODEL] [-l LANG] [-n] [-tr] FILE [FILE ...]
 
 Transcribes audio or video into FILE.srt and FILE.txt next to each file.
 
   -c        use faster-whisper (CTranslate2) on the GPU instead of whisper.cpp
   -m MODEL  model name, default large-v3-turbo
   -l LANG   language code, default auto
+  -tr       translate into English instead of transcribing
   -n        print the backend and the model path, transcribe nothing
   -h        show this message
 
@@ -25,13 +26,22 @@ CT2=0
 MODEL=large-v3-turbo
 LANGUAGE=auto
 DRY=0
+TRANSLATE=()
 
-while getopts "cm:l:nh" opt; do
+args=()
+for arg in "$@"; do
+  [ "$arg" = -tr ] && arg=-t
+  args+=("$arg")
+done
+set -- "${args[@]}"
+
+while getopts "cm:l:nth" opt; do
   case $opt in
     c) CT2=1 ;;
     m) MODEL=$OPTARG ;;
     l) LANGUAGE=$OPTARG ;;
     n) DRY=1 ;;
+    t) TRANSLATE=(-tr) ;;
     h) usage; exit 0 ;;
     \?) usage >&2; exit 1 ;;
   esac
@@ -74,18 +84,18 @@ transcribe_cpp() {
   wav=$(mktemp --suffix=.wav)
   ffmpeg -loglevel error -y -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
     || { rm -f "$wav"; die "Cannot read $1. ffmpeg found no audio in it. Check the file."; }
-  whisper-cli -m "$model" -l "$LANGUAGE" -osrt -otxt -of "${1%.*}" "$wav"
+  whisper-cli -m "$model" -l "$LANGUAGE" "${TRANSLATE[@]}" -osrt -otxt -of "${1%.*}" "$wav"
   local status=$?
   rm -f "$wav"
   return $status
 }
 
 transcribe_ct2() {
-  "$WHISPER_CT_PYTHON" - "$model" "$LANGUAGE" "$1" "${1%.*}" <<'EOF'
+  "$WHISPER_CT_PYTHON" - "$model" "$LANGUAGE" "${#TRANSLATE[@]}" "$1" "${1%.*}" <<'EOF'
 import sys
 from faster_whisper import WhisperModel
 
-model_dir, language, audio, base = sys.argv[1:]
+model_dir, language, translate, audio, base = sys.argv[1:]
 
 try:
     model = WhisperModel(model_dir, device="cuda", compute_type="float16")
@@ -94,6 +104,7 @@ except (RuntimeError, ValueError) as error:
     model = WhisperModel(model_dir, device="cpu", compute_type="int8")
 
 segments, _ = model.transcribe(audio, language=None if language == "auto" else language,
+                               task="translate" if translate == "1" else "transcribe",
                                vad_filter=True)
 
 
