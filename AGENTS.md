@@ -4,11 +4,11 @@ Tier: 1
 
 ## What it is
 
-Thirteen shell commands for one Arch workstation: video transcoding,
-downloads, archives, screen recording, driver and package upkeep, network
-checks, and a focus blocker. They replace about thirty-five scripts that grew
-apart in `~/scree`. Every machine-specific value lives in one config file, so
-the repository itself is portable.
+Eleven shell commands for one Arch workstation: video transcoding,
+archives, screen recording, driver and package upkeep, network
+checks, and a focus blocker. They replace about thirty-five older one-off
+scripts. Every machine-specific value lives in one config file, so the
+repository itself is portable.
 
 ## Running it
 
@@ -24,7 +24,7 @@ ln -s "$PWD"/bin/* ~/.local/bin/
 
 ## Code
 
-`~/.config/claude/templates/agents/codestyle.md`, the same standard at every
+[`codestyle.md`](codestyle.md), the same standard at every
 tier. `lib/common.sh` is the only shared module; a command imports it and
 nothing else.
 
