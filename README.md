@@ -24,7 +24,7 @@ where a choice exists opens fzf instead of failing.
 |---|---|
 | `vidconv` | transcode video: `720p`, `tg` for messengers, `to EXT` for the container |
 | `extract` | extract any archive into the working directory or `-d DIR` |
-| `rec` | record the screen with sound, or the microphone, on X11 and Wayland |
+| `rec` | record the screen with the system sound and the microphone, or the microphone alone, on X11 and Wayland |
 | `dr` | drag files out of the terminal, matching partial names |
 | `relink` | replace every symlink under a directory with a hard link |
 | `archfix` | Arch upkeep: `cache`, `kernel`, `reinstall`, `time`, `clamav` |

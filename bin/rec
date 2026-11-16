@@ -5,25 +5,38 @@ set -uo pipefail
 need_command ffmpeg
 
 MODE=""
+MIC=1
 
 usage() {
   cat <<'EOF'
-Usage: rec [screen|voice]
+Usage: rec [--no-mic] [screen|voice]
 
-  screen  record the screen and the system sound
-  voice   record the microphone only
+  screen    record the screen, the system sound and the microphone
+  voice     record the microphone only
+  --no-mic  leave the microphone out of a screen recording
 
-Stop the recording with Ctrl-C. With no argument the mode is chosen with fzf.
+Stop the recording with Ctrl-C. With no mode it is chosen with fzf.
 Screen recordings go to REC_DIR, voice recordings to the working directory.
+The microphone is read from the default source as an app named "rec", so
+Easy Effects and similar tools can process it.
 EOF
 }
 
-case "${1:-}" in
-  -h|--help) usage; exit 0 ;;
-  screen|voice) MODE="$1" ;;
-  "") MODE=$(printf '%s\n' screen voice | pick mode) || exit 1 ;;
-  *) usage >&2; exit 1 ;;
-esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --no-mic) MIC=0 ;;
+    screen|voice) MODE="$1" ;;
+    *) usage >&2; exit 1 ;;
+  esac
+  shift
+done
+[ -n "$MODE" ] || MODE=$(printf '%s\n' screen voice | pick mode) || exit 1
+
+# "default" sets no target, so the stream follows the default source and an
+# effects app can move it like any other recorder.
+mic=(-f pulse -name rec -i default)
+amix="amix=inputs=2:duration=first:normalize=0[a]"
 
 sink_monitor() {
   need_command pactl
@@ -33,7 +46,7 @@ sink_monitor() {
 if [ "$MODE" = voice ]; then
   out="./voice_$(date +'%Y%m%d_%H%M%S').wav"
   echo "recording to $out, Ctrl-C to stop"
-  exec ffmpeg -y -f pulse -i default -c:a pcm_s16le -ac 1 -ar 16000 "$out"
+  exec ffmpeg -y "${mic[@]}" -c:a pcm_s16le -ac 1 -ar 16000 "$out"
 fi
 
 need_config REC_DIR
@@ -47,13 +60,42 @@ case "$(session_type)" in
     size=$(xrandr | awk '/ connected primary/ {print $4}' | cut -d'+' -f1)
     [ -n "$size" ] || size=$(xrandr | awk '/\*/ {print $1; exit}')
     echo "recording to $out, Ctrl-C to stop"
+    if [ "$MIC" = 0 ]; then
+      exec ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
+        -f pulse -i "$audio" -c:v libx264 -preset ultrafast -c:a aac "$out"
+    fi
     exec ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
-      -f pulse -i "$audio" -c:v libx264 -preset ultrafast -c:a aac "$out"
+      -f pulse -i "$audio" "${mic[@]}" \
+      -filter_complex "[1:a][2:a]$amix" -map 0:v -map "[a]" \
+      -c:v libx264 -preset ultrafast -c:a aac "$out"
     ;;
   wayland)
     need_command wf-recorder
     echo "recording to $out, Ctrl-C to stop"
-    exec wf-recorder -f "$out" --audio="$audio" -c libx264 -p preset=ultrafast
+    if [ "$MIC" = 0 ]; then
+      exec wf-recorder -f "$out" --audio="$audio" -c libx264 -p preset=ultrafast
+    fi
+    # wf-recorder takes one audio device, so the microphone is a second
+    # recorder, mixed in after the stop. Matroska parts survive the interrupt.
+    # ponytail: the mic starts before wf-recorder's first frame (about 100 ms);
+    # add -itsoffset to the mic input below if the voice lags.
+    video="${out%.mp4}.video.mkv"
+    voice="${out%.mp4}.mic.mka"
+    # Ctrl-C reaches both recorders. A second signal makes ffmpeg drop its
+    # file, so the script stops the mic itself only when Ctrl-C did not.
+    stopped=0
+    trap 'stopped=1' INT
+    ffmpeg -nostdin -loglevel error -y "${mic[@]}" -c:a flac "$voice" &
+    mic_pid=$!
+    wf-recorder -f "$video" --audio="$audio" -c libx264 -p preset=ultrafast
+    [ "$stopped" = 1 ] || kill "$mic_pid" 2>/dev/null
+    wait "$mic_pid"
+    echo "mixing the microphone into $out"
+    ffmpeg -nostdin -loglevel error -y -i "$video" -i "$voice" \
+      -filter_complex "[0:a][1:a]$amix" -map 0:v -map "[a]" \
+      -c:v copy -c:a aac "$out" \
+      || die "Cannot mix the microphone into $out. The parts are kept: $video $voice"
+    rm -f "$video" "$voice"
     ;;
   *)
     die "Cannot record the screen. The session is neither X11 nor Wayland. Use 'rec voice' or start a graphical session."
