@@ -6,14 +6,17 @@ need_command ffmpeg
 
 MODE=""
 MIC=1
+COMPACT=0
 
 usage() {
   cat <<'EOF'
-Usage: rec [--no-mic] [screen|voice]
+Usage: rec [--no-mic] [--compact] [screen|voice]
 
-  screen    record the screen, the system sound and the microphone
-  voice     record the microphone only
-  --no-mic  leave the microphone out of a screen recording
+  screen     record the screen, the system sound and the microphone
+  voice      record the microphone only
+  --no-mic   leave the microphone out of a screen recording
+  --compact  smaller file at 60 fps for long recordings: HEVC on the
+             first GPU that works, else x264 on the CPU
 
 Stop the recording with Ctrl-C. With no mode it is chosen with fzf.
 Screen recordings go to REC_DIR, voice recordings to the working directory.
@@ -26,6 +29,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --no-mic) MIC=0 ;;
+    -c|--compact) COMPACT=1 ;;
     screen|voice) MODE="$1" ;;
     *) usage >&2; exit 1 ;;
   esac
@@ -52,52 +56,99 @@ fi
 need_config REC_DIR
 mkdir -p "$REC_DIR" || die "Cannot use $REC_DIR. The directory could not be created. Set REC_DIR to a writable path."
 out="$REC_DIR/screen_$(date +'%Y%m%d_%H%M%S').mp4"
+# The recorders write Matroska parts: they stay readable after a crash or a
+# full disk. The mp4 is made from them after the stop.
+video="${out%.mp4}.video.mkv"
+voice="${out%.mp4}.mic.mka"
 audio=$(sink_monitor)
+started="recording to $out ($(df -h --output=avail "$REC_DIR" | tail -1 | tr -d ' ') free), Ctrl-C to stop"
+
+# Ctrl-C reaches every recorder. The script survives it to make the mp4, and
+# does not signal a recorder again: a second signal makes ffmpeg drop its file.
+stopped=0
+trap 'stopped=1' INT
+
+# Encoder candidates, best first, one per line. Each GPU gets its own line.
+compact_encoders() {
+  local dev
+  for dev in /dev/dri/renderD*; do
+    [ -e "$dev" ] && echo "${1//DEV/$dev}"
+  done
+  echo "$2"
+  echo "$3"
+}
 
 case "$(session_type)" in
   x11)
     need_command xrandr
     size=$(xrandr | awk '/ connected primary/ {print $4}' | cut -d'+' -f1)
     [ -n "$size" ] || size=$(xrandr | awk '/\*/ {print $1; exit}')
-    echo "recording to $out, Ctrl-C to stop"
-    if [ "$MIC" = 0 ]; then
-      exec ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
-        -f pulse -i "$audio" -c:v libx264 -preset ultrafast -c:a aac "$out"
+    read -ra xenc <<< "-c:v libx264 -preset ultrafast"
+    if [ "$COMPACT" = 1 ]; then
+      while read -r line; do
+        read -ra xenc <<< "$line"
+        ffmpeg -nostdin -v error -f lavfi -i testsrc2=s=640x360:d=0.2 "${xenc[@]}" -f null - 2>/dev/null && break
+      done < <(compact_encoders "-vaapi_device DEV -vf format=nv12,hwupload -c:v hevc_vaapi -qp 28" \
+        "-c:v hevc_nvenc -preset p5 -rc vbr -cq 28" "-c:v libx264 -preset veryfast -crf 26")
     fi
-    exec ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
-      -f pulse -i "$audio" "${mic[@]}" \
-      -filter_complex "[1:a][2:a]$amix" -map 0:v -map "[a]" \
-      -c:v libx264 -preset ultrafast -c:a aac "$out"
+    echo "$started (${xenc[*]})"
+    if [ "$MIC" = 0 ]; then
+      ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
+        -f pulse -i "$audio" "${xenc[@]}" -c:a aac "$video"
+    else
+      ffmpeg -y -f x11grab -s "$size" -framerate 60 -i "${DISPLAY:-:0.0}" \
+        -f pulse -i "$audio" "${mic[@]}" \
+        -filter_complex "[1:a][2:a]$amix" -map 0:v -map "[a]" \
+        "${xenc[@]}" -c:a aac "$video"
+    fi
     ;;
   wayland)
     need_command wf-recorder
-    echo "recording to $out, Ctrl-C to stop"
-    if [ "$MIC" = 0 ]; then
-      exec wf-recorder -f "$out" --audio="$audio" -c libx264 -p preset=ultrafast
-    fi
+    encoders="-c libx264 -p preset=ultrafast"
+    [ "$COMPACT" = 0 ] || encoders=$(compact_encoders "-c hevc_vaapi -d DEV -r 60 -p qp=28" \
+      "-c hevc_nvenc -r 60 -p preset=p5 -p rc=vbr -p cq=28" "-c libx264 -r 60 -p preset=veryfast -p crf=26")
+    echo "$started"
     # wf-recorder takes one audio device, so the microphone is a second
-    # recorder, mixed in after the stop. Matroska parts survive the interrupt.
+    # recorder, mixed in after the stop. Both restart for each encoder, so
+    # they stay in step. An encoder that dies within 3 s without Ctrl-C has
+    # failed to start, and the next one takes over.
     # ponytail: the mic starts before wf-recorder's first frame (about 100 ms);
-    # add -itsoffset to the mic input below if the voice lags.
-    video="${out%.mp4}.video.mkv"
-    voice="${out%.mp4}.mic.mka"
-    # Ctrl-C reaches both recorders. A second signal makes ffmpeg drop its
-    # file, so the script stops the mic itself only when Ctrl-C did not.
-    stopped=0
-    trap 'stopped=1' INT
-    ffmpeg -nostdin -loglevel error -y "${mic[@]}" -c:a flac "$voice" &
-    mic_pid=$!
-    wf-recorder -f "$video" --audio="$audio" -c libx264 -p preset=ultrafast
-    [ "$stopped" = 1 ] || kill "$mic_pid" 2>/dev/null
-    wait "$mic_pid"
-    echo "mixing the microphone into $out"
-    ffmpeg -nostdin -loglevel error -y -i "$video" -i "$voice" \
-      -filter_complex "[0:a][1:a]$amix" -map 0:v -map "[a]" \
-      -c:v copy -c:a aac "$out" \
-      || die "Cannot mix the microphone into $out. The parts are kept: $video $voice"
-    rm -f "$video" "$voice"
+    # add -itsoffset to the mic input in the mix if the voice lags.
+    recorded=0
+    # The list comes on fd 3, so wf-recorder keeps stdin for its output prompt.
+    while read -r line <&3; do
+      read -ra venc <<< "$line"
+      if [ "$MIC" = 1 ]; then
+        ffmpeg -nostdin -loglevel error -y "${mic[@]}" -c:a flac "$voice" &
+        mic_pid=$!
+      fi
+      begin=$SECONDS
+      wf-recorder -y -f "$video" --audio="$audio" "${venc[@]}"
+      if [ "$MIC" = 1 ]; then
+        [ "$stopped" = 1 ] || kill "$mic_pid" 2>/dev/null
+        wait "$mic_pid"
+      fi
+      if [ "$stopped" = 1 ] || [ $((SECONDS - begin)) -ge 3 ]; then
+        recorded=1
+        break
+      fi
+      echo "wf-recorder failed with: ${venc[*]}. Trying the next encoder." >&2
+    done 3<<< "$encoders"
+    [ "$recorded" = 1 ] || die "Cannot record the screen. Every encoder failed to start. Read the wf-recorder errors above."
     ;;
   *)
     die "Cannot record the screen. The session is neither X11 nor Wayland. Use 'rec voice' or start a graphical session."
     ;;
 esac
+
+if [ -s "$voice" ]; then
+  echo "mixing the microphone into $out"
+  ffmpeg -nostdin -loglevel error -y -i "$video" -i "$voice" \
+    -filter_complex "[0:a][1:a]$amix" -map 0:v -map "[a]" \
+    -c:v copy -c:a aac "$out" \
+    || die "Cannot mix the microphone into $out. The parts are kept: $video $voice"
+else
+  ffmpeg -nostdin -loglevel error -y -i "$video" -c copy "$out" \
+    || die "Cannot write $out. The recording is kept: $video"
+fi
+rm -f "$video" "$voice"
